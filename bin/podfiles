@@ -216,7 +216,41 @@ Use now:
 MSG
 }
 
+main() {
+  case "${1:-}" in
+    ""|-h|--help) usage; return 0;;
+    version) echo "$VERSION"; return 0;;
+  esac
+
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    k8s)
+      local action="${1:-}"; shift || true
+      case "$action" in
+        attach)        k8s_attach "$@";;
+        copy-busybox)  k8s_copy_busybox "$@";;
+        shell)         k8s_shell "$@";;
+        *) usage; return 2;;
+      esac
+      ;;
+    docker)
+      local action="${1:-}"; shift || true
+      case "$action" in
+        netshoot)      docker_netshoot "$@";;
+        copy-busybox)  docker_copy_busybox "$@";;
+        *) usage; return 2;;
+      esac
+      ;;
+    *) usage; return 2;;
+  esac
+}
+
 # ---- Dispatcher ----
+# If we're being sourced for tests (PODFILES_SOURCE_ONLY=1), skip dispatch.
+if [ "${PODFILES_SOURCE_ONLY:-0}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 sub="${1:-}"; shift || true
 case "$sub" in
   k8s)
@@ -238,3 +272,5 @@ case "$sub" in
     ;;
   *) usage; exit 2;;
 esac
+
+main "$@"

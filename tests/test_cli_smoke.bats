@@ -1,13 +1,12 @@
 #!/usr/bin/env bats
-
-load ./helpers.bash
+bats_require_minimum_version 1.5.0
 
 setup() {
   CLI="./bin/podfiles"
-  [[ -x "$CLI" ]] || chmod +x "$CLI"
+  [ -x "$CLI" ] || chmod +x "$CLI"
 }
 
-@test "version prints a semantic version" {
+@test "version prints semver" {
   run "$CLI" version
   [ "$status" -eq 0 ]
   [[ "$output" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
@@ -16,19 +15,19 @@ setup() {
 @test "help exits 0" {
   run "$CLI" --help
   [ "$status" -eq 0 ]
-  [[ "$output" =~ "USAGE" ]]
+  [[ "$output" =~ USAGE ]]
 }
 
-@test "k8s attach without kubectl returns 127" {
-  if require_cmd kubectl; then skip "kubectl present on runner"; fi
-  run "$CLI" k8s attach my-pod
+@test "k8s attach without kubectl returns 127 (clean warning)" {
+  command -v kubectl >/dev/null && skip "kubectl present on host"
+  run -127 "$CLI" k8s attach my-pod
   [ "$status" -eq 127 ]
-  [[ "$output" =~ "Missing: kubectl" ]]
+  [[ "$output" =~ Missing:\ kubectl ]]
 }
 
-@test "docker netshoot without docker returns 127" {
-  if require_cmd docker; then skip "docker present on runner"; fi
-  run "$CLI" docker netshoot my-container
+@test "docker netshoot without docker returns 127 (clean warning)" {
+  command -v docker >/dev/null && skip "docker present on host"
+  run -127 "$CLI" docker netshoot my-container
   [ "$status" -eq 127 ]
-  [[ "$output" =~ "Missing: docker" ]]
+  [[ "$output" =~ Missing:\ docker ]]
 }
