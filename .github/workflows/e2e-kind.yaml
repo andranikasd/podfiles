@@ -1,0 +1,40 @@
+name: E2E (Kind)
+
+on:
+  workflow_dispatch:  # run manually when you want
+
+permissions:
+  contents: read
+
+jobs:
+  kind-e2e:
+    name: kind cluster e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # Set up kind (cluster + kubectl)
+      - name: Create kind cluster
+        uses: helm/kind-action@v1.9.0
+        with:
+          cluster_name: podfiles-ci
+          wait: 120s
+
+      - name: Kubernetes version
+        run: kubectl version --short
+
+      - name: Build podfiles (make executable)
+        run: chmod +x bin/podfiles
+
+      - name: Launch a tiny pod (no tools)
+        run: |
+          kubectl run toolboxless --image=alpine:3 --restart=Never -- sleep 3600
+          kubectl wait --for=condition=Ready pod/toolboxless --timeout=90s
+
+      - name: Inject BusyBox with podfiles
+        run: ./bin/podfiles k8s copy-busybox toolboxless --as "ping,nslookup,wget,traceroute,sh"
+
+      - name: Prove DNS resolution works
+        run: |
+          kubectl exec toolboxless -- sh -lc 'export PATH=/tmp/podfiles/bin:$PATH; nslookup kubernetes.default.svc.cluster.local'
