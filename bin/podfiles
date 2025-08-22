@@ -1,21 +1,28 @@
 #!/usr/bin/env bash
 # podfiles — Tools on demand, inside your pods/containers.
-# Fuckless Debugging in containerized environments.
+# Tagline: Fuckless Debugging in containerized environments.
 set -Eeuo pipefail
 
-readonly VERSION="0.1.1"
-readonly SELF="$(basename "$0")"
+###############################################################################
+# Version & Self
+###############################################################################
+readonly VERSION="0.2.0"
+# shellcheck disable=SC2292
+readonly SELF="${0##*/}"
 
+###############################################################################
 # Defaults (override via env)
+###############################################################################
 : "${PODFILES_EPHEMERAL_IMAGE:=nicolaka/netshoot:latest}"
 : "${PODFILES_BUSYBOX_URL_AMD64:=https://busybox.net/downloads/binaries/1.36.1-x86_64-linux-musl/busybox}"
 : "${PODFILES_BUSYBOX_URL_ARM64:=https://busybox.net/downloads/binaries/1.36.1-aarch64-linux-musl/busybox}"
 : "${PODFILES_TMP_DIR:=/tmp/podfiles}"
 : "${PODFILES_BIN_DIR:=/tmp/podfiles/bin}"
 
-# Colors
+###############################################################################
+# UI (colors/icons) — respects NO_COLOR and non-TTY
+###############################################################################
 enable_colors() {
-  # color if stdout or stderr is a TTY and NO_COLOR not set
   if { [ -t 1 ] || [ -t 2 ]; } && [ -z "${NO_COLOR:-}" ]; then
     if command -v tput >/dev/null 2>&1 && tput setaf 1 >/dev/null 2>&1; then
       C_BOLD="$(tput bold)"; C_DIM="$(tput dim)"; C_RED="$(tput setaf 1)"
@@ -29,39 +36,56 @@ enable_colors() {
   else
     C_BOLD=''; C_DIM=''; C_RED=''; C_GRN=''; C_YLW=''; C_CYN=''; C_RST=''
   fi
+  # icons (fallback to ASCII if non-UTF)
+  ICON_OK="✅"; ICON_FAIL="❌"; ICON_WARN="⚠️"; ICON_INFO="ℹ️"; ICON_RUN="▶️"
 }
 enable_colors
 
-need() { command -v "$1" >/dev/null 2>&1 || { printf '%b[podfiles]%b Missing: %s\n' "$C_RED" "$C_RST" "$1" >&2; exit 127; }; }
-say()  { printf '%b[podfiles]%b %s\n' "$C_CYN" "$C_RST" "$*" >&2; }
-die()  { printf '%b[podfiles:ERR]%b %s\n' "$C_RED" "$C_RST" "$*" >&2; exit 1; }
+say()  { printf '%b%s%b %s\n' "$C_CYN" "[podfiles]" "$C_RST" "$*" >&2; }
+ok()   { printf '%b%s%b %s\n' "$C_GRN" "[ok]" "$C_RST" "$*" >&2; }
+warn() { printf '%b%s%b %s\n' "$C_YLW" "[warn]" "$C_RST" "$*" >&2; }
+err()  { printf '%b%s%b %s\n' "$C_RED" "[err]" "$C_RST" "$*" >&2; }
+need() { command -v "$1" >/dev/null 2>&1 || { err "Missing: $1"; exit 127; }; }
 
+box() {
+  # Pretty header box: box "Title"
+  local t="${1:-}"
+  printf '%s\n' "┌──────────────────────────────────────────────────────────┐"
+  printf '│ %s%-56s%s │\n' "$C_BOLD" "$t" "$C_RST"
+  printf '%s\n' "└──────────────────────────────────────────────────────────┘"
+}
+
+###############################################################################
+# Usage
+###############################################################################
 usage() {
+  box "$SELF v$VERSION — Tools on demand, inside your pods"
   cat <<EOF
-${C_BOLD}$SELF v$VERSION${C_RST} — Tools on demand, inside your pods.
-
 ${C_BOLD}USAGE${C_RST}
   $SELF k8s shell [-n NAMESPACE] POD
   $SELF k8s attach [-n NAMESPACE] POD [--image IMG] [--name NAME] [--] [CMD...]
   $SELF k8s copy-busybox [-n NAMESPACE] POD [--as ping,nslookup,wget,sh]
   $SELF docker netshoot CONTAINER [--] [CMD...]
   $SELF docker copy-busybox CONTAINER [--as ping,nslookup,wget,sh]
+  $SELF doctor
   $SELF version | -h | --help
 
+${C_BOLD}WHAT IT DOES${C_RST}
+  • ${C_BOLD}attach${C_RST} uses ${C_DIM}kubectl debug${C_RST} (ephemeral container) sharing the pod's namespaces.
+  • ${C_BOLD}copy-busybox${C_RST} uploads a static BusyBox and symlinks applets into ${C_DIM}${PODFILES_BIN_DIR}${C_RST}.
+  • ${C_BOLD}docker netshoot${C_RST} runs a toolbox sharing target container's network namespace.
+
 ${C_BOLD}NOTES${C_RST}
-  • attach uses 'kubectl debug' (ephemeral container sharing target namespaces).
-  • copy-busybox uploads static BusyBox and symlinks requested applets into ${PODFILES_BIN_DIR}.
-  • docker netshoot runs the toolbox sharing target container's network namespace.
+  • Needs ${C_BOLD}kubectl${C_RST} for k8s; ${C_BOLD}docker${C_RST} for Docker; ${C_BOLD}curl${C_RST} for BusyBox copy.
+  • Ephemeral containers may require RBAC: verb=update resource=pods/ephemeralcontainers.
 
 ${C_DIM}Fuckless Debugging in containerized environments.${C_RST}
 EOF
 }
 
-case "${1:-}" in
-  ""|-h|--help) usage; exit 0;;
-  version) echo "$VERSION"; exit 0;;
-esac
-
+###############################################################################
+# Helpers
+###############################################################################
 detect_arch() {
   case "$(uname -m)" in
     x86_64|amd64) printf 'amd64\n' ;;
@@ -70,7 +94,20 @@ detect_arch() {
   esac
 }
 
-# ---- K8s helpers ----
+k_can_ephemeral() {
+  # Returns 0 if user likely can use ephemeral containers; best-effort checks.
+  command -v kubectl >/dev/null 2>&1 || return 1
+  # kubectl auth can-i is cheap and informative
+  if kubectl auth can-i update pods/ephemeralcontainers >/dev/null 2>&1; then
+    return 0
+  fi
+  # fallback heuristic: k8s v1.23+ has 'kubectl debug'
+  kubectl debug -h >/dev/null 2>&1
+}
+
+###############################################################################
+# Kubernetes flows
+###############################################################################
 k8s_attach() {
   need kubectl
   local ns="" pod="" img="$PODFILES_EPHEMERAL_IMAGE" name=""
@@ -83,23 +120,24 @@ k8s_attach() {
       *) if [ -z "${pod:-}" ]; then pod="$1"; shift; else break; fi;;
     esac
   done
-  # Remaining args are the command
   local cmd=( "${@:-/bin/bash}" )
-  [ -n "$pod" ] || die "POD required"
+  [ -n "$pod" ] || { err "POD required"; return 2; }
   [ -n "$name" ] || name="podfiles-$(date +%H%M%S)-$RANDOM"
 
-  # pick first container name if present
+  if ! k_can_ephemeral; then
+    warn "Ephemeral containers likely not permitted; try: '$SELF k8s copy-busybox [-n ns] $pod'"
+  fi
+
   local target=""
   target="$(kubectl get pod "$pod" ${ns:+-n "$ns"} -o jsonpath='{.spec.containers[0].name}' 2>/dev/null || true)"
 
-  # Build command
   # shellcheck disable=SC2206
   local base=( kubectl debug "pod/$pod" --image="$img" -it --share-processes )
   [ -n "$ns" ] && base+=( -n "$ns" )
   [ -n "$target" ] && base+=( --target="$target" )
   base+=( --container="$name" -- )
 
-  say "Ephemeral attach → ${C_DIM}${img}${C_RST}"
+  say "$ICON_RUN attach → ${C_DIM}${img}${C_RST}"
   exec "${base[@]}" "${cmd[@]}"
 }
 
@@ -113,7 +151,7 @@ k8s_copy_busybox() {
       *) if [ -z "${pod:-}" ]; then pod="$1"; shift; else break; fi;;
     esac
   done
-  [ -n "$pod" ] || die "POD required"
+  [ -n "$pod" ] || { err "POD required"; return 2; }
 
   local url
   case "$(detect_arch)" in
@@ -121,14 +159,17 @@ k8s_copy_busybox() {
     *)     url="$PODFILES_BUSYBOX_URL_AMD64" ;;
   esac
 
-  say "Fetching BusyBox (${C_DIM}${url}${C_RST})"
+  say "$ICON_INFO fetch BusyBox (${C_DIM}${url}${C_RST})"
   local tmp; tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
   curl -fsSL "$url" -o "$tmp/busybox"
   chmod +x "$tmp/busybox"
 
-  kubectl exec ${ns:+-n "$ns"} "$pod" -- sh -lc "mkdir -p '$PODFILES_BIN_DIR' '$PODFILES_TMP_DIR'"
-  kubectl cp "$tmp/busybox" "${ns:+$ns/}$pod:$PODFILES_BIN_DIR/busybox"
+  # ensure dirs in pod
+  kubectl exec ${ns:+-n "$ns"} "$pod" -- sh -lc "mkdir -p '$PODFILES_BIN_DIR' '$PODFILES_TMP_DIR'" >/dev/null
+  # copy busybox
+  kubectl cp "$tmp/busybox" "${ns:+$ns/}$pod:$PODFILES_BIN_DIR/busybox" >/dev/null
 
+  # symlink requested applets
   IFS=',' read -r -a tools <<<"$as_list"
   local link_cmd=""
   for t in "${tools[@]}"; do
@@ -138,12 +179,12 @@ k8s_copy_busybox() {
   done
   link_cmd="${link_cmd}printf 'export PATH=%s:\\\$PATH\\n' '$PODFILES_BIN_DIR' > '$PODFILES_TMP_DIR/profile'"
 
-  kubectl exec ${ns:+-n "$ns"} "$pod" -- sh -lc "$link_cmd"
+  kubectl exec ${ns:+-n "$ns"} "$pod" -- sh -lc "$link_cmd" >/dev/null
 
-  printf '%b%s%b\n' "$C_GRN" "✅ BusyBox installed into $pod:$PODFILES_BIN_DIR" "$C_RST"
-  cat <<'MSG'
+  ok "$ICON_OK BusyBox installed → $pod:${PODFILES_BIN_DIR}"
+  cat <<MSG
 Use now:
-  kubectl exec -it -n <ns> <pod> -- sh -lc 'export PATH=/tmp/podfiles/bin:$PATH; sh'
+  kubectl exec -it ${ns:+-n "$ns"} "$pod" -- sh -lc 'export PATH=${PODFILES_BIN_DIR}:\$PATH; sh'
 MSG
 }
 
@@ -155,30 +196,33 @@ k8s_shell() {
       *) if [ -z "${pod:-}" ]; then pod="$1"; shift; else break; fi;;
     esac
   done
-  [ -n "$pod" ] || die "POD required"
-  # Try ephemeral first; fallback to busybox copy
+  [ -n "$pod" ] || { err "POD required"; return 2; }
+
+  # Try ephemeral first
   if k8s_attach ${ns:+-n "$ns"} "$pod" -- /bin/bash; then
-    exit 0
+    return 0
   fi
-  say "Ephemeral attach failed → falling back to BusyBox copy"
+  warn "Ephemeral attach failed → falling back to BusyBox"
   k8s_copy_busybox ${ns:+-n "$ns"} "$pod" --as "ping,nslookup,wget,traceroute,sh"
   exec kubectl exec -it ${ns:+-n "$ns"} "$pod" -- sh -lc "export PATH=$PODFILES_BIN_DIR:\$PATH; sh"
 }
 
-# ---- Docker helpers ----
+###############################################################################
+# Docker flows
+###############################################################################
 docker_netshoot() {
   need docker
   local target="${1:-}"; shift || true
-  [ -n "$target" ] || die "CONTAINER required"
+  [ -n "$target" ] || { err "CONTAINER required"; return 2; }
   local cmd=( "${@:-bash}" )
-  say "netshoot → ${C_DIM}$PODFILES_EPHEMERAL_IMAGE${C_RST} sharing container:${target}"
+  say "$ICON_RUN netshoot → ${C_DIM}$PODFILES_EPHEMERAL_IMAGE${C_RST} (network=container:${target})"
   exec docker run --rm -it --network "container:${target}" "$PODFILES_EPHEMERAL_IMAGE" "${cmd[@]}"
 }
 
 docker_copy_busybox() {
   need docker; need curl
   local target="${1:-}"; shift || true
-  [ -n "$target" ] || die "CONTAINER required"
+  [ -n "$target" ] || { err "CONTAINER required"; return 2; }
   local as_list="ping,nslookup,wget,traceroute,sh"
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -196,8 +240,8 @@ docker_copy_busybox() {
   local tmp; tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
   curl -fsSL "$url" -o "$tmp/busybox"; chmod +x "$tmp/busybox"
 
-  docker exec "$target" sh -lc "mkdir -p '$PODFILES_BIN_DIR' '$PODFILES_TMP_DIR'"
-  docker cp "$tmp/busybox" "$target:$PODFILES_BIN_DIR/busybox"
+  docker exec "$target" sh -lc "mkdir -p '$PODFILES_BIN_DIR' '$PODFILES_TMP_DIR'" >/dev/null
+  docker cp "$tmp/busybox" "$target:$PODFILES_BIN_DIR/busybox" >/dev/null
 
   IFS=',' read -r -a tools <<<"$as_list"
   local link_cmd=""
@@ -208,18 +252,52 @@ docker_copy_busybox() {
   done
   link_cmd="${link_cmd}printf 'export PATH=%s:\\\$PATH\\n' '$PODFILES_BIN_DIR' > '$PODFILES_TMP_DIR/profile'"
 
-  docker exec "$target" sh -lc "$link_cmd"
-  printf '%b%s%b\n' "$C_GRN" "✅ BusyBox installed into container:$target at $PODFILES_BIN_DIR" "$C_RST"
+  docker exec "$target" sh -lc "$link_cmd" >/dev/null
+  ok "$ICON_OK BusyBox installed → container:${target} at ${PODFILES_BIN_DIR}"
   cat <<'MSG'
 Use now:
   docker exec -it <container> sh -lc 'export PATH=/tmp/podfiles/bin:$PATH; sh'
 MSG
 }
 
+###############################################################################
+# Doctor (preflight diagnostics)
+###############################################################################
+doctor() {
+  box "podfiles doctor"
+  printf '%s\n' "• Host arch: $(detect_arch)"
+  printf '%s'   "• kubectl: "
+  if command -v kubectl >/dev/null 2>&1; then
+    echo "found"
+    printf '%s' "  - Ephemeral containers allowed: "
+    if k_can_ephemeral; then echo "likely YES"; else echo "likely NO"; fi
+  else
+    echo "missing"
+  fi
+
+  printf '%s' "• docker: "
+  if command -v docker >/dev/null 2>&1; then echo "found"; else echo "missing"; fi
+
+  printf '%s' "• curl: "
+  if command -v curl   >/dev/null 2>&1; then echo "found"; else echo "missing"; fi
+
+  echo
+  echo "Images/Binaries:"
+  echo "  - Ephemeral image: $PODFILES_EPHEMERAL_IMAGE"
+  echo "  - BusyBox (amd64): $PODFILES_BUSYBOX_URL_AMD64"
+  echo "  - BusyBox (arm64): $PODFILES_BUSYBOX_URL_ARM64"
+  echo
+  ok "$ICON_OK Doctor complete."
+}
+
+###############################################################################
+# Main
+###############################################################################
 main() {
   case "${1:-}" in
     ""|-h|--help) usage; return 0;;
     version) echo "$VERSION"; return 0;;
+    doctor) doctor; return 0;;
   esac
 
   local sub="${1:-}"; shift || true
@@ -241,36 +319,17 @@ main() {
         *) usage; return 2;;
       esac
       ;;
-    *) usage; return 2;;
+    *)
+      usage; return 2;;
   esac
 }
 
-# ---- Dispatcher ----
-# If we're being sourced for tests (PODFILES_SOURCE_ONLY=1), skip dispatch.
-if [ "${PODFILES_SOURCE_ONLY:-0}" = "1" ]; then
-  return 0 2>/dev/null || exit 0
+###############################################################################
+# Entry (source-safe for tests)
+###############################################################################
+# If sourced (return succeeds) or explicit request not to run, skip.
+if [ "${PODFILES_SOURCE_ONLY:-0}" = "1" ] || ( return 0 2>/dev/null ); then
+  :
+else
+  main "$@"
 fi
-
-sub="${1:-}"; shift || true
-case "$sub" in
-  k8s)
-    action="${1:-}"; shift || true
-    case "$action" in
-      attach)        k8s_attach "$@";;
-      copy-busybox)  k8s_copy_busybox "$@";;
-      shell)         k8s_shell "$@";;
-      *) usage; exit 2;;
-    esac
-    ;;
-  docker)
-    action="${1:-}"; shift || true
-    case "$action" in
-      netshoot)      docker_netshoot "$@";;
-      copy-busybox)  docker_copy_busybox "$@";;
-      *) usage; exit 2;;
-    esac
-    ;;
-  *) usage; exit 2;;
-esac
-
-main "$@"
