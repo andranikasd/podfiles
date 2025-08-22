@@ -16,17 +16,17 @@ log()  { printf '[podfiles] %s\n' "$*" >&2; }
 die()  { printf '[podfiles:ERR] %s\n' "$*" >&2; exit 1; }
 
 usage() {
-  cat <<'EOF'
-podfiles - Tools on demand, inside your pods.
+  cat <<EOF
+$SELF v$VERSION - Tools on demand, inside your pods.
 
 USAGE
-  podfiles k8s shell [-n NAMESPACE] POD
-  podfiles k8s attach [-n NAMESPACE] POD [--image IMG] [--name NAME] [--] [CMD...]
-  podfiles k8s copy-busybox [-n NAMESPACE] POD [--as ping,nslookup,wget,sh]
-  podfiles docker netshoot CONTAINER [--] [CMD...]
-  podfiles docker copy-busybox CONTAINER [--as ping,nslookup,wget,sh]
-  podfiles version | -h | --help
-
+  $SELF k8s shell [-n NAMESPACE] POD
+  $SELF k8s attach [-n NAMESPACE] POD [--image IMG] [--name NAME] [--] [CMD...]
+  $SELF k8s copy-busybox [-n NAMESPACE] POD [--as ping,nslookup,wget,sh]
+  $SELF docker netshoot CONTAINER [--] [CMD...]
+  $SELF docker copy-busybox CONTAINER [--as ping,nslookup,wget,sh]
+  $SELF version | -h | --help
+}
 NOTES
   • attach uses 'kubectl debug' ephemeral containers (shares target namespaces).
   • copy-busybox uploads a static busybox and symlinks requested applets.
