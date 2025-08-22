@@ -6,7 +6,7 @@ set -Eeuo pipefail
 ###############################################################################
 # Version & Self
 ###############################################################################
-readonly VERSION="0.2.0"
+readonly VERSION="0.2.1"
 # shellcheck disable=SC2292
 readonly SELF="${0##*/}"
 
@@ -14,8 +14,14 @@ readonly SELF="${0##*/}"
 # Defaults (override via env)
 ###############################################################################
 : "${PODFILES_EPHEMERAL_IMAGE:=nicolaka/netshoot:latest}"
-: "${PODFILES_BUSYBOX_URL_AMD64:=https://busybox.net/downloads/binaries/1.36.1-x86_64-linux-musl/busybox}"
-: "${PODFILES_BUSYBOX_URL_ARM64:=https://busybox.net/downloads/binaries/1.36.1-aarch64-linux-musl/busybox}"
+# Multiple candidate URLs; we try them in order (fast → fallback).
+: "${PODFILES_BUSYBOX_URLS_AMD64:=\
+https://frippery.org/files/busybox/busybox-x86_64 \
+https://busybox.net/downloads/binaries/1.36.1-x86_64-linux-musl/busybox \
+https://busybox.net/downloads/binaries/1.36.1-x86_64-linux-glibc/busybox}"
+: "${PODFILES_BUSYBOX_URLS_ARM64:=\
+https://busybox.net/downloads/binaries/1.36.1-aarch64-linux-musl/busybox}"
+
 : "${PODFILES_TMP_DIR:=/tmp/podfiles}"
 : "${PODFILES_BIN_DIR:=/tmp/podfiles/bin}"
 
@@ -36,7 +42,6 @@ enable_colors() {
   else
     C_BOLD=''; C_DIM=''; C_RED=''; C_GRN=''; C_YLW=''; C_CYN=''; C_RST=''
   fi
-  # icons (fallback to ASCII if non-UTF)
   ICON_OK="✅"; ICON_FAIL="❌"; ICON_WARN="⚠️"; ICON_INFO="ℹ️"; ICON_RUN="▶️"
 }
 enable_colors
@@ -48,7 +53,6 @@ err()  { printf '%b%s%b %s\n' "$C_RED" "[err]" "$C_RST" "$*" >&2; }
 need() { command -v "$1" >/dev/null 2>&1 || { err "Missing: $1"; exit 127; }; }
 
 box() {
-  # Pretty header box: box "Title"
   local t="${1:-}"
   printf '%s\n' "┌──────────────────────────────────────────────────────────┐"
   printf '│ %s%-56s%s │\n' "$C_BOLD" "$t" "$C_RST"
@@ -86,7 +90,7 @@ EOF
 ###############################################################################
 # Helpers
 ###############################################################################
-detect_arch() {
+detect_arch_host() {
   case "$(uname -m)" in
     x86_64|amd64) printf 'amd64\n' ;;
     aarch64|arm64) printf 'arm64\n' ;;
@@ -95,14 +99,95 @@ detect_arch() {
 }
 
 k_can_ephemeral() {
-  # Returns 0 if user likely can use ephemeral containers; best-effort checks.
   command -v kubectl >/dev/null 2>&1 || return 1
-  # kubectl auth can-i is cheap and informative
   if kubectl auth can-i update pods/ephemeralcontainers >/dev/null 2>&1; then
     return 0
   fi
-  # fallback heuristic: k8s v1.23+ has 'kubectl debug'
   kubectl debug -h >/dev/null 2>&1
+}
+
+# Resolve pod's node arch (kubernetes.io/arch), fallback to host arch on failure.
+k_resolve_pod_arch() {
+  local ns="$1" pod="$2"
+  local node arch
+  node="$(kubectl get pod "$pod" ${ns:+-n "$ns"} -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)"
+  if [ -n "$node" ]; then
+    arch="$(kubectl get node "$node" -o jsonpath='{.metadata.labels.kubernetes\.io/arch}' 2>/dev/null || true)"
+  fi
+  case "$arch" in
+    amd64|arm64) echo "$arch" ;;
+    *) detect_arch_host ;;
+  esac
+}
+
+# Resolve container arch via docker inspect, fallback to host arch.
+docker_resolve_container_arch() {
+  local target="$1"
+  local arch
+  arch="$(docker inspect -f '{{.Architecture}}' "$target" 2>/dev/null || true)"
+  case "$arch" in
+    amd64|x86_64) echo "amd64" ;;
+    arm64|aarch64) echo "arm64" ;;
+    *) detect_arch_host ;;
+  esac
+}
+
+_is_elf() {
+  # Check ELF magic without extra deps (od is in coreutils)
+  [ -s "$1" ] || return 1
+  local magic
+  magic="$(head -c 4 "$1" 2>/dev/null | od -An -t x1 | tr -d ' \n')"
+  [ "$magic" = "7f454c46" ]  # 0x7F 'E' 'L' 'F'
+}
+
+_fetch_busybox_to() {
+  # args: <dest-path> [arch]
+  local dest="$1"
+  local arch="${2:-$(detect_arch_host)}"
+  local urls
+  if [ "$arch" = "arm64" ]; then
+    urls="$PODFILES_BUSYBOX_URLS_ARM64"
+  else
+    urls="$PODFILES_BUSYBOX_URLS_AMD64"
+  fi
+
+  for u in $urls; do
+    say "$ICON_INFO trying BusyBox from ${u}"
+    if curl -fsSL "$u" -o "$dest"; then
+      chmod +x "$dest" || true
+      if _is_elf "$dest"; then
+        ok "$ICON_OK downloaded BusyBox for $arch"
+        return 0
+      fi
+      warn "downloaded file is not ELF; ignoring"
+    else
+      warn "fetch failed from ${u}"
+    fi
+  done
+
+  # docker fallback: extract /bin/busybox from busybox:latest
+  if command -v docker >/dev/null 2>&1; then
+    warn "falling back to extracting BusyBox from docker image…"
+    local img="busybox:latest" cid=""
+    if docker pull "$img" >/dev/null 2>&1; then
+      cid="$(docker create "$img" true 2>/dev/null || true)"
+      if [ -n "$cid" ]; then
+        if docker cp "$cid:/bin/busybox" "$dest" >/dev/null 2>&1; then
+          docker rm -f "$cid" >/dev/null 2>&1 || true
+          chmod +x "$dest" || true
+          if _is_elf "$dest"; then
+            ok "$ICON_OK extracted BusyBox from $img"
+            return 0
+          fi
+        fi
+        docker rm -f "$cid" >/dev/null 2>&1 || true
+      fi
+    fi
+  fi
+
+  err "could not obtain a BusyBox binary (all URLs failed, docker fallback unavailable/failed).
+Set PODFILES_BUSYBOX_URLS_AMD64/ARM64 to your own mirror and retry."
+  return 1
 }
 
 ###############################################################################
@@ -122,8 +207,8 @@ k8s_attach() {
   done
   local cmd=( "${@:-/bin/bash}" )
   [ -n "$pod" ] || { err "POD required"; return 2; }
-  [ -n "$name" ] || name="podfiles-$(date +%H%M%S)-$RANDOM"
 
+  [ -n "$name" ] || name="podfiles-$(date +%H%M%S)-$RANDOM"
   if ! k_can_ephemeral; then
     warn "Ephemeral containers likely not permitted; try: '$SELF k8s copy-busybox [-n ns] $pod'"
   fi
@@ -153,23 +238,19 @@ k8s_copy_busybox() {
   done
   [ -n "$pod" ] || { err "POD required"; return 2; }
 
-  local url
-  case "$(detect_arch)" in
-    arm64) url="$PODFILES_BUSYBOX_URL_ARM64" ;;
-    *)     url="$PODFILES_BUSYBOX_URL_AMD64" ;;
-  esac
+  # pick arch of the node running this pod
+  local arch; arch="$(k_resolve_pod_arch "$ns" "$pod")"
 
-  say "$ICON_INFO fetch BusyBox (${C_DIM}${url}${C_RST})"
+  # temp dir always defined (avoid unbound var on set -u)
   local tmp; tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-  curl -fsSL "$url" -o "$tmp/busybox"
-  chmod +x "$tmp/busybox"
+  local bb="$tmp/busybox"
+  if ! _fetch_busybox_to "$bb" "$arch"; then
+    return 1
+  fi
 
-  # ensure dirs in pod
   kubectl exec ${ns:+-n "$ns"} "$pod" -- sh -lc "mkdir -p '$PODFILES_BIN_DIR' '$PODFILES_TMP_DIR'" >/dev/null
-  # copy busybox
-  kubectl cp "$tmp/busybox" "${ns:+$ns/}$pod:$PODFILES_BIN_DIR/busybox" >/dev/null
+  kubectl cp "$bb" "${ns:+$ns/}$pod:$PODFILES_BIN_DIR/busybox" >/dev/null
 
-  # symlink requested applets
   IFS=',' read -r -a tools <<<"$as_list"
   local link_cmd=""
   for t in "${tools[@]}"; do
@@ -181,7 +262,7 @@ k8s_copy_busybox() {
 
   kubectl exec ${ns:+-n "$ns"} "$pod" -- sh -lc "$link_cmd" >/dev/null
 
-  ok "$ICON_OK BusyBox installed → $pod:${PODFILES_BIN_DIR}"
+  ok "$ICON_OK BusyBox installed → $pod:${PODFILES_BIN_DIR} (arch=${arch})"
   cat <<MSG
 Use now:
   kubectl exec -it ${ns:+-n "$ns"} "$pod" -- sh -lc 'export PATH=${PODFILES_BIN_DIR}:\$PATH; sh'
@@ -198,7 +279,6 @@ k8s_shell() {
   done
   [ -n "$pod" ] || { err "POD required"; return 2; }
 
-  # Try ephemeral first
   if k8s_attach ${ns:+-n "$ns"} "$pod" -- /bin/bash; then
     return 0
   fi
@@ -231,17 +311,16 @@ docker_copy_busybox() {
     esac
   done
 
-  local url
-  case "$(detect_arch)" in
-    arm64) url="$PODFILES_BUSYBOX_URL_ARM64" ;;
-    *)     url="$PODFILES_BUSYBOX_URL_AMD64" ;;
-  esac
+  local arch; arch="$(docker_resolve_container_arch "$target")"
 
   local tmp; tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-  curl -fsSL "$url" -o "$tmp/busybox"; chmod +x "$tmp/busybox"
+  local bb="$tmp/busybox"
+  if ! _fetch_busybox_to "$bb" "$arch"; then
+    return 1
+  fi
 
   docker exec "$target" sh -lc "mkdir -p '$PODFILES_BIN_DIR' '$PODFILES_TMP_DIR'" >/dev/null
-  docker cp "$tmp/busybox" "$target:$PODFILES_BIN_DIR/busybox" >/dev/null
+  docker cp "$bb" "$target:$PODFILES_BIN_DIR/busybox" >/dev/null
 
   IFS=',' read -r -a tools <<<"$as_list"
   local link_cmd=""
@@ -253,7 +332,7 @@ docker_copy_busybox() {
   link_cmd="${link_cmd}printf 'export PATH=%s:\\\$PATH\\n' '$PODFILES_BIN_DIR' > '$PODFILES_TMP_DIR/profile'"
 
   docker exec "$target" sh -lc "$link_cmd" >/dev/null
-  ok "$ICON_OK BusyBox installed → container:${target} at ${PODFILES_BIN_DIR}"
+  ok "$ICON_OK BusyBox installed → container:${target} at ${PODFILES_BIN_DIR} (arch=${arch})"
   cat <<'MSG'
 Use now:
   docker exec -it <container> sh -lc 'export PATH=/tmp/podfiles/bin:$PATH; sh'
@@ -265,7 +344,7 @@ MSG
 ###############################################################################
 doctor() {
   box "podfiles doctor"
-  printf '%s\n' "• Host arch: $(detect_arch)"
+  printf '%s\n' "• Host arch: $(detect_arch_host)"
   printf '%s'   "• kubectl: "
   if command -v kubectl >/dev/null 2>&1; then
     echo "found"
@@ -284,8 +363,19 @@ doctor() {
   echo
   echo "Images/Binaries:"
   echo "  - Ephemeral image: $PODFILES_EPHEMERAL_IMAGE"
-  echo "  - BusyBox (amd64): $PODFILES_BUSYBOX_URL_AMD64"
-  echo "  - BusyBox (arm64): $PODFILES_BUSYBOX_URL_ARM64"
+  echo "  - BusyBox URLs (amd64): $PODFILES_BUSYBOX_URLS_AMD64"
+  echo "  - BusyBox URLs (arm64): $PODFILES_BUSYBOX_URLS_ARM64"
+
+  echo
+  printf '%s' "• BusyBox fetch probe: "
+  local tdir; tdir="$(mktemp -d)"
+  if _fetch_busybox_to "$tdir/busybox" >/dev/null 2>&1; then
+    echo "ok"
+  else
+    echo "failed (configure mirrors or ensure docker available for fallback)"
+  fi
+  rm -rf "$tdir" || true
+
   echo
   ok "$ICON_OK Doctor complete."
 }
