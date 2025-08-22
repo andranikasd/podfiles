@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+VERSION="0.1.0"
+SELF="$(basename "$0")"
+
+# Defaults (override via env)
+PODFILES_EPHEMERAL_IMAGE="${PODFILES_EPHEMERAL_IMAGE:-nicolaka/netshoot:latest}"
+PODFILES_BUSYBOX_URL_AMD64="${PODFILES_BUSYBOX_URL_AMD64:-https://busybox.net/downloads/binaries/1.36.1-x86_64-linux-musl/busybox}"
+PODFILES_BUSYBOX_URL_ARM64="${PODFILES_BUSYBOX_URL_ARM64:-https://busybox.net/downloads/binaries/1.36.1-aarch64-linux-musl/busybox}"
+PODFILES_TMP_DIR="${PODFILES_TMP_DIR:-/tmp/podfiles}"
+PODFILES_BIN_DIR="${PODFILES_BIN_DIR:-/tmp/podfiles/bin}"
+
+need() { command -v "$1" >/dev/null 2>&1 || { echo "[podfiles] Missing: $1" >&2; exit 127; }; }
+log()  { printf '[podfiles] %s\n' "$*" >&2; }
+die()  { printf '[podfiles:ERR] %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+podfiles - Tools on demand, inside your pods.
+
+USAGE
+  podfiles k8s shell [-n NAMESPACE] POD
+  podfiles k8s attach [-n NAMESPACE] POD [--image IMG] [--name NAME] [--] [CMD...]
+  podfiles k8s copy-busybox [-n NAMESPACE] POD [--as ping,nslookup,wget,sh]
+  podfiles docker netshoot CONTAINER [--] [CMD...]
+  podfiles docker copy-busybox CONTAINER [--as ping,nslookup,wget,sh]
+  podfiles version | -h | --help
+
+NOTES
+  • attach uses 'kubectl debug' ephemeral containers (shares target namespaces).
+  • copy-busybox uploads a static busybox and symlinks requested applets.
+  • docker netshoot shares the target container network namespace.
+EOF
+}
+
+case "${1:-}" in
+  ""|-h|--help) usage; exit 0;;
+  version) echo "$VERSION"; exit 0;;
+esac
+
+detect_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo "amd64";;
+    aarch64|arm64) echo "arm64";;
+    *) echo "amd64";;
+  esac
+}
+
+k8s_attach() {
+  need kubectl
+  local ns="" pod="" img="$PODFILES_EPHEMERAL_IMAGE" name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--namespace) ns="$2"; shift 2;;
+      --image) img="$2"; shift 2;;
+      --name) name="$2"; shift 2;;
+      --) shift; break;;
+      *) if [[ -z "$pod" ]]; then pod="$1"; shift; else break; fi;;
+    esac
+  done
+  local cmd=( "${@:-/bin/bash}" )
+  [[ -z "$pod" ]] && die "POD required"
+  [[ -z "$name" ]] && name="podfiles-$(date +%H%M%S)-$RANDOM"
+
+  local base=(kubectl debug "pod/$pod" --image="$img" -it --share-processes)
+  [[ -n "$ns" ]] && base+=( -n "$ns" )
+
+  # Target 1st container if available
+  local target=""
+  target="$(kubectl get pod "$pod" ${ns:+-n "$ns"} -o jsonpath='{.spec.containers[0].name}' 2>/dev/null || true)"
+  [[ -n "$target" ]] && base+=( --target="$target" )
+
+  base+=( --container="$name" -- )
+  log "Ephemeral attach: ${base[*]} ${cmd[*]}"
+  exec "${base[@]}" "${cmd[@]}"
+}
+
+k8s_copy_busybox() {
+  need kubectl; need curl
+  local ns="" pod="" as_list="ping,nslookup,wget,traceroute,sh"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--namespace) ns="$2"; shift 2;;
+      --as) as_list="$2"; shift 2;;
+      *) if [[ -z "$pod" ]]; then pod="$1"; shift; else break; fi;;
+    esac
+  done
+  [[ -z "$pod" ]] && die "POD required"
+
+  local url; case "$(detect_arch)" in
+    arm64) url="$PODFILES_BUSYBOX_URL_ARM64";;
+    *)     url="$PODFILES_BUSYBOX_URL_AMD64";;
+  esac
+
+  local tmp; tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+  curl -fsSL "$url" -o "$tmp/busybox"; chmod +x "$tmp/busybox"
+
+  kubectl exec ${ns:+-n "$ns"} "$pod" -- sh -lc "mkdir -p '$PODFILES_BIN_DIR' '$PODFILES_TMP_DIR'"
+  kubectl cp "$tmp/busybox" "${ns:+$ns/}$pod:$PODFILES_BIN_DIR/busybox"
+
+  IFS=',' read -r -a tools <<<"$as_list"
+  local link_cmd=""
+  for t in "${tools[@]}"; do
+    t="$(echo "$t" | xargs)"; [[ -z "$t" ]] && continue
+    link_cmd+="ln -sf '$PODFILES_BIN_DIR/busybox' '$PODFILES_BIN_DIR/$t' ; "
+  done
+  link_cmd+="printf 'export PATH=%s:\$PATH\n' '$PODFILES_BIN_DIR' > '$PODFILES_TMP_DIR/profile'"
+  kubectl exec ${ns:+-n "$ns"} "$pod" -- sh -lc "$link_cmd"
+
+  cat <<MSG
+✅ BusyBox installed in pod '$pod' at $PODFILES_BIN_DIR
+Use now:
+  kubectl exec -it ${ns:+-n "$ns"} "$pod" -- sh -lc 'export PATH=$PODFILES_BIN_DIR:\$PATH; sh'
+MSG
+}
+
+k8s_shell() {
+  local ns="" pod=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--namespace) ns="$2"; shift 2;;
+      *) if [[ -z "$pod" ]]; then pod="$1"; shift; else break; fi;;
+    esac
+  done
+  [[ -z "$pod" ]] && die "POD required"
+  if k8s_attach ${ns:+-n "$ns"} "$pod" -- /bin/bash; then exit 0; fi
+  log "Ephemeral attach failed; falling back to busybox copy…"
+  k8s_copy_busybox ${ns:+-n "$ns"} "$pod" --as "ping,nslookup,wget,traceroute,sh"
+  exec kubectl exec -it ${ns:+-n "$ns"} "$pod" -- sh -lc "export PATH=$PODFILES_BIN_DIR:\$PATH; sh"
+}
+
+docker_netshoot() {
+  need docker
+  local target="${1:-}"; shift || true
+  [[ -z "$target" ]] && die "CONTAINER required"
+  local cmd=( "${@:-bash}" )
+  exec docker run --rm -it --network "container:${target}" "$PODFILES_EPHEMERAL_IMAGE" "${cmd[@]}"
+}
+
+docker_copy_busybox() {
+  need docker; need curl
+  local target="${1:-}"; shift || true
+  [[ -z "$target" ]] && die "CONTAINER required"
+  local as_list="ping,nslookup,wget,traceroute,sh"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --as) as_list="$2"; shift 2;;
+      *) break;;
+    esac
+  done
+  local url; case "$(detect_arch)" in
+    arm64) url="$PODFILES_BUSYBOX_URL_ARM64";;
+    *)     url="$PODFILES_BUSYBOX_URL_AMD64";;
+  esac
+  local tmp; tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+  curl -fsSL "$url" -o "$tmp/busybox"; chmod +x "$tmp/busybox"
+
+  docker exec "$target" sh -lc "mkdir -p '$PODFILES_BIN_DIR' '$PODFILES_TMP_DIR'"
+  docker cp "$tmp/busybox" "$target:$PODFILES_BIN_DIR/busybox"
+
+  IFS=',' read -r -a tools <<<"$as_list"
+  local link_cmd=""
+  for t in "${tools[@]}"; do
+    t="$(echo "$t" | xargs)"; [[ -z "$t" ]] && continue
+    link_cmd+="ln -sf '$PODFILES_BIN_DIR/busybox' '$PODFILES_BIN_DIR/$t' ; "
+  done
+  link_cmd+="printf 'export PATH=%s:\$PATH\n' '$PODFILES_BIN_DIR' > '$PODFILES_TMP_DIR/profile'"
+  docker exec "$target" sh -lc "$link_cmd"
+
+  cat <<MSG
+✅ BusyBox installed in container '$target' at $PODFILES_BIN_DIR
+Use now:
+  docker exec -it "$target" sh -lc 'export PATH=$PODFILES_BIN_DIR:\$PATH; sh'
+MSG
+}
+
+sub="${1:-}"; shift || true
+case "$sub" in
+  k8s)
+    action="${1:-}"; shift || true
+    case "$action" in
+      attach)        k8s_attach "$@";;
+      copy-busybox)  k8s_copy_busybox "$@";;
+      shell)         k8s_shell "$@";;
+      *) usage; exit 2;;
+    esac
+    ;;
+  docker)
+    action="${1:-}"; shift || true
+    case "$action" in
+      netshoot)      docker_netshoot "$@";;
+      copy-busybox)  docker_copy_busybox "$@";;
+      *) usage; exit 2;;
+    esac
+    ;;
+  *) usage; exit 2;;
+esac

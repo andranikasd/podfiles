@@ -1,0 +1,31 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [ master ]
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    name: ShellCheck
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Lint
+        run: shellcheck bin/podfiles
+
+  tests:
+    runs-on: ubuntu-latest
+    name: Bats tests
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bats
+        run: sudo apt-get update && sudo apt-get install -y bats
+      - name: Run tests
+        run: bats -r tests

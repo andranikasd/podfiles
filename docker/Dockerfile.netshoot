@@ -1,0 +1,2 @@
+FROM nicolaka/netshoot:latest
+# Optionally pin more tools or versions here
