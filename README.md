@@ -1,8 +1,3 @@
-Here’s a strong **README draft** for your `podfiles` repo based on your tagline *“Fuckless Debugging in containerized environments”*.
-It sets the tone as fun but still professional enough for GitHub. You can tone up/down the language as you like.
-
----
-
 # podfiles
 
 **Fuckless Debugging in containerized environments**
