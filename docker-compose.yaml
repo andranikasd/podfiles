@@ -1,0 +1,13 @@
+version: "3.8"
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dev
+    image: podfiles/dev:latest
+    container_name: podfiles-dev
+    stdin_open: true
+    tty: true
+    working_dir: /work
+    volumes:
+      - ./:/work
